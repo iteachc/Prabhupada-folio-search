@@ -1,0 +1,11 @@
+# corpus and derived data — copyrighted text, never commit
+corpus/*.jsonl
+corpus/*.js
+corpus/*.norms.txt
+index*/
+models/
+*.rawtxt
+*.RTF
+*.rtf
+__pycache__/
+*.pyc

@@ -1,0 +1,90 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>Srila Prabhupada — Folio Search</title>
+<style>
+ :root{--accent:#8a5a2b;--bg:#faf6ef;--card:#fff;--ink:#2b2216}
+ *{box-sizing:border-box} body{font-family:Georgia,serif;background:var(--bg);color:var(--ink);max-width:880px;margin:0 auto;padding:24px 16px}
+ h1{font-size:1.35em;color:var(--accent);margin:0 0 4px}
+ .sub{color:#7a6a52;font-size:.9em;margin-bottom:14px}
+ #q{width:100%;font-size:1.1em;padding:12px 14px;border:2px solid var(--accent);border-radius:8px;font-family:inherit}
+ .modes,.secs{margin:8px 0;color:#7a6a52;font-size:.9em}
+ .secs label{display:inline-block;background:#f2e9d8;border:1px solid #e0d2b4;border-radius:14px;padding:3px 11px;margin:2px 3px;cursor:pointer;user-select:none}
+ .secs label.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+ .secs input{display:none}
+ .hit{background:var(--card);border:1px solid #e5dcc9;border-radius:8px;padding:13px 15px;margin-bottom:11px;cursor:pointer}
+ .ref{font-weight:bold;color:var(--accent);font-size:.95em}
+ .tag{font-size:.72em;background:#efe4cd;border-radius:9px;padding:1px 8px;margin-left:8px;color:#7a5a2b}
+ .snip{font-size:.94em;line-height:1.5;white-space:pre-wrap;margin-top:6px}
+ .nores{color:#8a5a2b;font-style:italic;padding:18px 4px}
+mark{background:#f3d9a4;padding:0 1px}
+.openrec{font-size:.78em;color:#8a5a2b;margin-left:8px}
+</style></head><body>
+<h1>Srila Prabhupada — Folio Search</h1>
+<div class="sub">Keyword + semantic search with section filters. Verbatim quotes only.</div>
+<input id="q" type="search" placeholder="e.g. how to control the restless mind" autofocus>
+<div class="secs" id="secs"></div>
+<div class="modes">
+ <label><input type="radio" name="m" value="hybrid" checked> hybrid</label>
+ <label><input type="radio" name="m" value="keyword"> keyword</label>
+ <label><input type="radio" name="m" value="semantic"> semantic</label>
+</div>
+<div id="results"></div>
+<script>
+const SECTIONS=['BG','SB','CC','Other Books','Lectures','Conversations','Letters','Other','Notes'];
+const secsDiv=document.getElementById('secs');
+for(const s of SECTIONS){
+  const l=document.createElement('label'); l.className='on';
+  l.innerHTML='<input type="checkbox" checked value="'+s+'">'+s;
+  l.onclick=e=>{e.preventDefault();const c=l.querySelector('input');c.checked=!c.checked;l.classList.toggle('on',c.checked);run()};
+  secsDiv.appendChild(l);
+}
+const q=document.getElementById('q'),out=document.getElementById('results');
+let timer;
+q.addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(run,350)});
+document.querySelectorAll('input[name=m]').forEach(r=>r.addEventListener('change',run));
+async function run(){
+  const qs=q.value.trim(); out.innerHTML='';
+  if(!qs) return;
+  const mode=document.querySelector('input[name=m]:checked').value;
+  const on=[...secsDiv.querySelectorAll('input:checked')].map(c=>c.value);
+  const sp=(on.length && on.length<SECTIONS.length)?'&secs='+encodeURIComponent(on.join(',')):'';
+  out.innerHTML='<div class="nores">searching…</div>';
+  let res;
+  try{
+    const resp=await fetch('/api?q='+encodeURIComponent(qs)+'&mode='+mode+sp);
+    if(!resp.ok){out.innerHTML='<div class="nores">Server error '+resp.status+' — check the terminal window running serve_v3.py for the traceback.</div>';return}
+    res=await resp.json();
+  }catch(e){
+    out.innerHTML='<div class="nores">Could not reach the server ('+e.message+'). Is serve_v3.py still running in the terminal?</div>';return
+  }
+  out.innerHTML='';
+  if(!res.length){out.innerHTML='<div class="nores">Not found in the selected sections.</div>';return}
+  const D=s=>s.normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
+  const needles=[...qs.matchAll(/"([^"]+)"/g)].map(m=>D(m[1]))
+    .concat(qs.replace(/"[^"]*"/g,' ').split(/\s+/).filter(Boolean).map(D));
+  const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  function hl(text){
+    const norm=D(text), ranges=[];
+    for(const t of needles){ if(!t)continue; let i=-1;
+      while((i=norm.indexOf(t,i+1))!==-1) ranges.push([i,i+t.length]); }
+    if(!ranges.length||norm.length!==text.length) return esc(text);
+    ranges.sort((a,b)=>a[0]-b[0]);
+    const mg=[]; for(const r of ranges){
+      if(mg.length&&r[0]<=mg[mg.length-1][1]) mg[mg.length-1][1]=Math.max(mg[mg.length-1][1],r[1]);
+      else mg.push(r.slice()); }
+    let o='',last=0;
+    for(const [a,b] of mg){o+=esc(text.slice(last,a))+'<mark>'+esc(text.slice(a,b))+'</mark>';last=b}
+    return o+esc(text.slice(last));
+  }
+  for(const r of res){
+    const d=document.createElement('div'); d.className='hit';
+    const recUrl='/record?corpus='+encodeURIComponent(r.corpus)+'&i='+r.i+'&q='+encodeURIComponent(qs);
+    d.innerHTML='<span class="ref">'+esc(r.ref)+'</span><span class="tag">'+esc(r.sec||r.corpus)+' · '+r.how+' '+r.score+'</span>'+
+                ' <a class="openrec" target="_blank" href="'+recUrl+'">open full ↗</a>'+
+                '<div class="snip">'+hl(r.snippet||r.text.slice(0,500))+'…</div>';
+    d.querySelector('.openrec').addEventListener('click',e=>e.stopPropagation());
+    let open=false;
+    d.onclick=()=>{open=!open;d.querySelector('.snip').innerHTML=open?hl(r.text):hl(r.snippet||r.text.slice(0,500))+'…'};
+    out.appendChild(d);
+  }
+}
+</script></body></html>
