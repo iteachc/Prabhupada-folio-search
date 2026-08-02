@@ -63,10 +63,21 @@ async function run(){
     .concat(qs.replace(/"[^"]*"/g,' ').split(/\s+/).filter(Boolean).map(D));
   const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
   function hl(text){
-    const norm=D(text), ranges=[];
+    const ranges=[];
+    // build norm string with index map back to original positions
+    const n2o=[]; let norm='';
+    for(let oi=0;oi<text.length;oi++){
+      const nc=D(text[oi]);
+      for(const c of nc){ n2o.push(oi); norm+=c; }
+    }
+    n2o.push(text.length); // sentinel
     for(const t of needles){ if(!t)continue; let i=-1;
-      while((i=norm.indexOf(t,i+1))!==-1) ranges.push([i,i+t.length]); }
-    if(!ranges.length||norm.length!==text.length) return esc(text);
+      while((i=norm.indexOf(t,i+1))!==-1){
+        const oStart=n2o[i], oEnd=n2o[Math.min(i+t.length,n2o.length-1)];
+        ranges.push([oStart,oEnd]);
+      }
+    }
+    if(!ranges.length) return esc(text);
     ranges.sort((a,b)=>a[0]-b[0]);
     const mg=[]; for(const r of ranges){
       if(mg.length&&r[0]<=mg[mg.length-1][1]) mg[mg.length-1][1]=Math.max(mg[mg.length-1][1],r[1]);

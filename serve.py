@@ -53,6 +53,59 @@ def norm(s):
             _NTBL[o] = _nmap(ch)
     return s.translate(_NTBL)
 
+def _norm_with_map(s):
+    """Return (normalized_string, orig2norm, norm2orig) index maps."""
+    parts = []; o2n = []; n2o = []
+    ni = 0
+    for oi, ch in enumerate(s):
+        nc = _nmap(ch)
+        o2n.append(ni)
+        for c in nc:
+            n2o.append(oi)
+            ni += 1
+        parts.append(nc)
+    o2n.append(ni)
+    n2o.append(len(s))
+    return ''.join(parts), o2n, n2o
+
+def _highlight(body, qtext):
+    """Highlight query terms in body, diacritic-insensitive. Returns HTML."""
+    import re as _r, html as _h
+    if not qtext.strip():
+        return _h.escape(body)
+    needles = [norm(x) for x in _r.findall(r'"([^"]+)"', qtext)]
+    needles += [norm(x) for x in _r.sub(r'"[^"]*"', ' ', qtext).split() if x]
+    if not needles:
+        return _h.escape(body)
+    nb, o2n, n2o = _norm_with_map(body)
+    spans = []
+    for t in needles:
+        if not t: continue
+        st = 0
+        while True:
+            p = nb.find(t, st)
+            if p < 0: break
+            orig_start = n2o[p]
+            orig_end = n2o[min(p + len(t), len(n2o) - 1)]
+            spans.append((orig_start, orig_end))
+            st = p + 1
+    if not spans:
+        return _h.escape(body)
+    spans.sort()
+    merged = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    outp = []; last = 0
+    for a, b in merged:
+        outp.append(_h.escape(body[last:a]))
+        outp.append('<mark>' + _h.escape(body[a:b]) + '</mark>')
+        last = b
+    outp.append(_h.escape(body[last:]))
+    return ''.join(outp)
+
 class Corpus:
     def __init__(self, name, jsonl, idxdir):
         self.name = name
@@ -126,6 +179,11 @@ def search(cs, q, mode='hybrid', secs=None):
             qv = embed_query(q)
         except Exception as e:
             print('[semantic disabled: embedding model failed to load —', str(e)[:120], ']')
+    # pre-compute normalized query terms for term-boost and supplementary pass
+    _qneedles=[]
+    if q.strip():
+        _qneedles=[norm(x) for x in re.findall(r'"([^"]+)"', q)]
+        _qneedles+=[norm(x) for x in re.sub(r'"[^"]*"',' ',q).split() if x]
     for c in cs:
         seen=set()
         if mode in ('hybrid','keyword'):
@@ -138,10 +196,29 @@ def search(cs, q, mode='hybrid', secs=None):
             for sc,i,w in c.semantic(qv):
                 if i in seen: continue
                 if secs and c.recs[i]['sec'] not in secs: continue
+                seen.add(i)
                 t=c.recs[i]['text']
-                results.append({'corpus':c.name,'i':i,'ref':c.recs[i]['ref'],'sec':c.recs[i]['sec'],'score':round(sc,3),
+                # boost semantic score if record contains actual query terms
+                n_t=c.norms[i] if i<len(c.norms) else norm(t)
+                term_hits=sum(1 for nd in _qneedles if nd and nd in n_t)
+                boost = 0.15 * term_hits / max(len(_qneedles),1) if _qneedles else 0
+                results.append({'corpus':c.name,'i':i,'ref':c.recs[i]['ref'],'sec':c.recs[i]['sec'],
+                                'score':round(sc+boost,3),
                                 'how':'semantic','text':t,
                                 'snippet_at': w['a'] if w else 0})
+        # supplement: find records containing most query terms that keyword/semantic missed
+        if _qneedles and mode in ('hybrid','semantic'):
+            for i,n in enumerate(c.norms):
+                if i in seen: continue
+                if secs and c.recs[i]['sec'] not in secs: continue
+                hits=sum(1 for nd in _qneedles if nd and nd in n)
+                if hits >= max(len(_qneedles)-1, 1):
+                    seen.add(i)
+                    pos=min((n.find(nd) for nd in _qneedles if nd and nd in n), default=0)
+                    results.append({'corpus':c.name,'i':i,'ref':c.recs[i]['ref'],'sec':c.recs[i]['sec'],
+                                    'score':round(0.5 + 0.1*hits,3),
+                                    'how':'keyword+','text':c.recs[i]['text'],'snippet_at':pos})
+    results.sort(key=lambda r: -r['score'])
     return results
 
 PAGE = open(os.path.join(TOOL,'serve_page.html'),encoding='utf-8').read() \
@@ -182,6 +259,19 @@ def main():
                     s.send_response(500); s.end_headers(); s.wfile.write(str(e).encode()); return
                 for r in out:
                     at=r.pop('snippet_at',0)
+                    # For semantic results, try to find actual query terms and re-center snippet
+                    if r.get('how')=='semantic' and q.strip():
+                        import re as _r2
+                        needles=[norm(x) for x in _r2.findall(r'"([^"]+)"', q)]
+                        needles+=[norm(x) for x in _r2.sub(r'"[^"]*"',' ',q).split() if x]
+                        nt=norm(r['text'])
+                        for nd in needles:
+                            if not nd: continue
+                            p=nt.find(nd)
+                            if p>=0:
+                                _,_o2n,_n2o=_norm_with_map(r['text'])
+                                at=_n2o[min(p,len(_n2o)-1)]
+                                break
                     pre='…' if at>100 else ''
                     r['snippet']=pre+r['text'][max(0,at-100):at+500]
                     if len(r['text'])>6000:
@@ -200,35 +290,7 @@ def main():
                     s.send_response(404); s.end_headers(); return
                 r=cobj.recs[idx]
                 body=r['text']
-                # highlight query terms (diacritic-insensitive, via norm index map)
-                if qtext.strip():
-                    import re as _r
-                    needles=[norm(x) for x in _r.findall(r'"([^"]+)"', qtext)]
-                    needles+= [norm(x) for x in _r.sub(r'"[^"]*"',' ',qtext).split() if x]
-                    n=norm(body)
-                    if len(n)==len(body):
-                        spans=[]
-                        for t in needles:
-                            if not t: continue
-                            st=0
-                            while True:
-                                p=n.find(t,st)
-                                if p<0: break
-                                spans.append((p,p+len(t))); st=p+1
-                        spans.sort(); merged=[]
-                        for a,b in spans:
-                            if merged and a<=merged[-1][1]: merged[-1]=(merged[-1][0],max(merged[-1][1],b))
-                            else: merged.append((a,b))
-                        import html as _h
-                        outp=[]; last=0
-                        for a,b in merged:
-                            outp.append(_h.escape(body[last:a])); outp.append('<mark>'+_h.escape(body[a:b])+'</mark>'); last=b
-                        outp.append(_h.escape(body[last:]))
-                        body='' .join(outp)
-                    else:
-                        import html as _h; body=_h.escape(body)
-                else:
-                    import html as _h; body=_h.escape(body)
+                body = _highlight(body, qtext)
                 page=('<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+r['ref']+
                     '</title><style>body{font-family:Georgia,serif;background:#faf6ef;color:#2b2216;'
                     'max-width:820px;margin:0 auto;padding:30px 16px;line-height:1.6}'
