@@ -112,6 +112,10 @@ class Corpus:
         jp = os.path.join(TOOL, jsonl)
         self.recs = [json.loads(l) for l in open(jp,encoding='utf-8')]
         for r in self.recs: r['sec'] = classify(r['ref'], name)
+        # Folio repeats some sections verbatim (e.g. Song Purports); keep first copy
+        first = {}
+        self.dup = {i for i, r in enumerate(self.recs)
+                    if first.setdefault((r['ref'], r['text']), i) != i}
         cache = jp + '.norms.txt'
         self.norms = None
         if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(jp):
@@ -130,13 +134,18 @@ class Corpus:
             M /= (np.linalg.norm(M,axis=1,keepdims=True)+1e-9)
             self.sem = M
 
-    def keyword(self, q):
+    def skip(self, i, secs):
+        """Duplicate record, or outside the selected sections."""
+        return i in self.dup or bool(secs and self.recs[i]['sec'] not in secs)
+
+    def keyword(self, q, secs=None):
         phrases = re.findall(r'"([^"]+)"', q)
         terms = [t for t in re.sub(r'"[^"]*"',' ',q).split() if t]
         needles = [norm(x) for x in (phrases+terms)]
         if not needles: return []
         hits=[]
         for i,n in enumerate(self.norms):
+            if self.skip(i, secs): continue    # filter BEFORE the top-K cut
             if all(x in n for x in needles):
                 sc = sum(min(n.count(x),4) for x in needles) + 2000/(len(n)+500)
                 pos = min((n.find(x) for x in needles))
@@ -144,14 +153,16 @@ class Corpus:
         hits.sort(reverse=True)
         return hits[:TOPK]
 
-    def semantic(self, qv):
+    def semantic(self, qv, secs=None):
         if self.sem is None: return []
         sc = self.sem @ qv
-        order = np.argsort(-sc)[:TOPK*3]
         best={}
-        for t in order:
+        # walk windows best-first until TOPK distinct allowed records are found
+        for t in np.argsort(-sc):
             w=self.wins[t]; ri=w['ri']
-            if ri not in best or sc[t]>best[ri][0]:
+            if self.skip(ri, secs): continue
+            if ri not in best:
+                if len(best) >= TOPK: break
                 best[ri]=(float(sc[t]), t)
         out=[(s, ri, self.wins[t]) for ri,(s,t) in best.items()]
         out.sort(reverse=True)
@@ -187,15 +198,13 @@ def search(cs, q, mode='hybrid', secs=None):
     for c in cs:
         seen=set()
         if mode in ('hybrid','keyword'):
-            for sc,i,pos in c.keyword(q):
-                if secs and c.recs[i]['sec'] not in secs: continue
+            for sc,i,pos in c.keyword(q, secs):
                 seen.add(i)
                 results.append({'corpus':c.name,'i':i,'ref':c.recs[i]['ref'],'sec':c.recs[i]['sec'],'score':round(sc,2),
                                 'how':'keyword','text':c.recs[i]['text'],'snippet_at':pos or 0})
         if qv is not None and mode in ('hybrid','semantic'):
-            for sc,i,w in c.semantic(qv):
+            for sc,i,w in c.semantic(qv, secs):
                 if i in seen: continue
-                if secs and c.recs[i]['sec'] not in secs: continue
                 seen.add(i)
                 t=c.recs[i]['text']
                 # boost semantic score if record contains actual query terms
@@ -209,8 +218,7 @@ def search(cs, q, mode='hybrid', secs=None):
         # supplement: find records containing most query terms that keyword/semantic missed
         if _qneedles and mode in ('hybrid','semantic'):
             for i,n in enumerate(c.norms):
-                if i in seen: continue
-                if secs and c.recs[i]['sec'] not in secs: continue
+                if i in seen or c.skip(i, secs): continue
                 hits=sum(1 for nd in _qneedles if nd and nd in n)
                 if hits >= max(len(_qneedles)-1, 1):
                     seen.add(i)
